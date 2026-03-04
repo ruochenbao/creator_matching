@@ -56,6 +56,7 @@ top_n = st.slider("推荐达人数量", min_value=1, max_value=10, value=5)
 # ==================== 推荐函数 ====================
 def recommend(category, price, commission_rate, top_n, df, model, feature_cols):
     df_settled = df[df['订单状态'] == '已结算'].copy()
+    st.write("列名：", df_settled.columns.tolist())  # 临时调试行
 
     creator_stats = df_settled.groupby('handle').agg(
         creator_avg_gmv        = ('该商品GMV', 'mean'),
