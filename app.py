@@ -58,35 +58,54 @@ def recommend(category, price, commission_rate, top_n, df, model, feature_cols):
     df_settled = df[df['订单状态'] == '已结算'].copy()
 
     creator_stats = df_settled.groupby('handle').agg(
-        creator_avg_gmv     = ('该商品GMV', 'mean'),
-        creator_median_gmv  = ('该商品GMV', 'median'),
-        creator_order_count = ('订单id', 'count'),
-        creator_avg_comm    = ('佣金率', 'mean'),
+        creator_avg_gmv        = ('该商品GMV', 'mean'),
+        creator_median_gmv     = ('该商品GMV', 'median'),
+        creator_std_gmv        = ('该商品GMV', 'std'),
+        creator_order_count    = ('订单id',    'count'),
+        creator_avg_commission = ('佣金率',    'mean'),
     ).reset_index()
+    creator_stats['creator_std_gmv'] = creator_stats['creator_std_gmv'].fillna(0)
 
-    cat_col = 'category' if 'category' in df_settled.columns else '品类'
-    cat_count   = df_settled.groupby(['handle', cat_col]).size().reset_index(name='cat_count')
+    # 品类偏好度
+    cat_count   = df_settled.groupby(['handle', 'category']).size().reset_index(name='cat_count')
     total_count = df_settled.groupby('handle').size().reset_index(name='total_count')
     cat_pref    = cat_count.merge(total_count, on='handle')
-    cat_pref['category_preference'] = cat_pref['cat_count'] / cat_pref['total_count']
-    cat_pref_filtered = cat_pref[cat_pref[cat_col] == category][['handle','category_preference']]
+    cat_pref['cat_preference'] = cat_pref['cat_count'] / cat_pref['total_count']
+    cat_pref_filtered = cat_pref[cat_pref['category'] == category][['handle', 'cat_preference']]
 
     candidates = creator_stats.merge(cat_pref_filtered, on='handle', how='left')
-    candidates['category_preference'] = candidates['category_preference'].fillna(0)
+    candidates['cat_preference'] = candidates['cat_preference'].fillna(0)
 
-    candidates['price_vs_creator_avg'] = (
-        (price - candidates['creator_avg_gmv']) / (candidates['creator_avg_gmv'] + 0.01)
-    )
-    candidates['log_price']       = np.log1p(price)
-    candidates['佣金率']           = commission_rate
-    candidates['commission_diff'] = commission_rate - candidates['creator_avg_comm']
+    # 达人在该品类的历史GMV均值
+    cat_stats = df_settled[df_settled['category'] == category].groupby('handle').agg(
+        cat_avg_gmv     = ('该商品GMV', 'mean'),
+        cat_std_gmv     = ('该商品GMV', 'std'),
+        cat_order_count = ('订单id',    'count'),
+    ).reset_index()
+    cat_stats['cat_std_gmv'] = cat_stats['cat_std_gmv'].fillna(0)
+
+    candidates = candidates.merge(cat_stats, on='handle', how='left')
+    candidates['cat_avg_gmv']     = candidates['cat_avg_gmv'].fillna(candidates['creator_avg_gmv'])
+    candidates['cat_std_gmv']     = candidates['cat_std_gmv'].fillna(candidates['creator_std_gmv'])
+    candidates['cat_order_count'] = candidates['cat_order_count'].fillna(0)
+    candidates['cat_vs_overall']  = candidates['cat_avg_gmv'] - candidates['creator_avg_gmv']
+
+    # 商品特征
+    candidates['current_commission']   = commission_rate
+    candidates['current_qty']          = 1
+    candidates['price_deviation']      = (price - candidates['creator_avg_gmv']) / (candidates['creator_avg_gmv'] + 0.01)
+    candidates['commission_deviation'] = commission_rate - candidates['creator_avg_commission']
+    candidates['log_gmv']              = np.log1p(price)
+    candidates['hour']                 = 12
+    candidates['weekday']              = 1
 
     for col in feature_cols:
         if col not in candidates.columns:
             candidates[col] = 0
 
     X = candidates[feature_cols].fillna(0)
-    candidates['matching_score'] = model.predict_proba(X)[:, 1]
+    candidates['matching_score']      = model.predict_proba(X)[:, 1]
+    candidates['category_preference'] = candidates['cat_preference']
 
     result = candidates.sort_values('matching_score', ascending=False).head(top_n)
     return result
