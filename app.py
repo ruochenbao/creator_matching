@@ -213,6 +213,7 @@ if st.button("🚀 开始匹配", type="primary"):
         })
 
     display_df = pd.DataFrame(rows)
+    display_df.index = range(1, len(display_df) + 1)
     st.dataframe(display_df, use_container_width=True)
 
     # 图例说明
