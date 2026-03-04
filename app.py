@@ -90,8 +90,13 @@ def recommend(category, price, commission_rate, top_n, df, model, feature_cols):
         if col in feature_cols:
             candidates[col] = 0
 
+    # 补全所有模型需要但candidates里没有的列
+    for col in feature_cols:
+        if col not in candidates.columns:
+            candidates[col] = 0
+
     X = candidates[feature_cols].fillna(0)
-    candidates['matching_score'] = model.predict_proba(X)[:, 1]
+        candidates['matching_score'] = model.predict_proba(X)[:, 1]
 
     result = candidates.sort_values('matching_score', ascending=False).head(top_n)
     return result
