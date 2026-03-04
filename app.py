@@ -151,6 +151,12 @@ if st.button("🚀 开始匹配", type="primary"):
         result = recommend(category, price, commission, top_n, df, model, FEATURE_COLS)
 
     st.subheader(f"🏆 Top {top_n} 推荐达人")
+    # 当所有推荐达人品类偏好度都为0时，显示提示
+    if (result['category_preference'] == 0).all():
+        st.warning(
+            f"⚠️ 当前达人库中暂无 **{category}** 品类的历史带货数据，"
+            "以下推荐仅基于价格带匹配，区分度有限。建议结合「推荐备注」列的内容效率数据进行人工判断。"
+        )
 
     rows = []
     for _, row in result.iterrows():
