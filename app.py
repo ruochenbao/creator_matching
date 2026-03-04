@@ -59,7 +59,6 @@ def recommend(category, price, commission_rate, top_n, df, model, feature_cols):
     # 兼容新旧pkl：统一列名
     if '品类' in df_settled.columns and 'category' not in df_settled.columns:
         df_settled = df_settled.rename(columns={'品类': 'category'})
-    st.write("列名：", df_settled.columns.tolist())  # 临时调试行，确认后删除
 
     creator_stats = df_settled.groupby('handle').agg(
         creator_avg_gmv        = ('该商品GMV', 'mean'),
