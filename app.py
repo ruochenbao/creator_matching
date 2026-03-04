@@ -2,7 +2,6 @@ import streamlit as st
 import joblib
 import pandas as pd
 import numpy as np
-import os
 
 # ==================== 加载模型文件 ====================
 @st.cache_resource
@@ -58,7 +57,6 @@ top_n = st.slider("推荐达人数量", min_value=1, max_value=10, value=5)
 def recommend(category, price, commission_rate, top_n, df, model, feature_cols):
     df_settled = df[df['订单状态'] == '已结算'].copy()
 
-    # 按达人汇总特征
     creator_stats = df_settled.groupby('handle').agg(
         creator_avg_gmv     = ('该商品GMV', 'mean'),
         creator_median_gmv  = ('该商品GMV', 'median'),
@@ -66,18 +64,16 @@ def recommend(category, price, commission_rate, top_n, df, model, feature_cols):
         creator_avg_comm    = ('佣金率', 'mean'),
     ).reset_index()
 
-    # 品类偏好度
     cat_col = 'category' if 'category' in df_settled.columns else '品类'
     cat_count   = df_settled.groupby(['handle', cat_col]).size().reset_index(name='cat_count')
     total_count = df_settled.groupby('handle').size().reset_index(name='total_count')
     cat_pref    = cat_count.merge(total_count, on='handle')
     cat_pref['category_preference'] = cat_pref['cat_count'] / cat_pref['total_count']
-    cat_pref_filtered = cat_pref[cat_pref[cat_col] == category][['handle', 'category_preference']]
+    cat_pref_filtered = cat_pref[cat_pref[cat_col] == category][['handle','category_preference']]
 
     candidates = creator_stats.merge(cat_pref_filtered, on='handle', how='left')
     candidates['category_preference'] = candidates['category_preference'].fillna(0)
 
-    # 构造特征
     candidates['price_vs_creator_avg'] = (
         (price - candidates['creator_avg_gmv']) / (candidates['creator_avg_gmv'] + 0.01)
     )
@@ -85,12 +81,6 @@ def recommend(category, price, commission_rate, top_n, df, model, feature_cols):
     candidates['佣金率']           = commission_rate
     candidates['commission_diff'] = commission_rate - candidates['creator_avg_comm']
 
-    # 补充视频特征（如果有的话）
-    for col in ['avg_ctr', 'avg_ctor', 'avg_rpm', 'median_rpm', 'video_count']:
-        if col in feature_cols:
-            candidates[col] = 0
-
-    # 补全所有模型需要但candidates里没有的列
     for col in feature_cols:
         if col not in candidates.columns:
             candidates[col] = 0
@@ -101,27 +91,59 @@ def recommend(category, price, commission_rate, top_n, df, model, feature_cols):
     result = candidates.sort_values('matching_score', ascending=False).head(top_n)
     return result
 
-# ==================== 查询内容效率画像 ====================
+# ==================== 内容效率查询 ====================
 def get_content_metrics(handle, category, profile_by_cat):
+    """返回：avg_ctr(float或None), avg_ctor(float或None), avg_rpm(float或None), is_category_specific(bool)"""
     if profile_by_cat is None:
-        return '-', '-', '-'
+        return None, None, None, False
+
+    # 先找达人+品类的精确数据
     row = profile_by_cat[
         (profile_by_cat['Creator username'] == handle) &
         (profile_by_cat['category'] == category)
     ]
-    if len(row) == 0:
-        # 没有该品类数据，用该达人整体数据
-        row_all = profile_by_cat[profile_by_cat['Creator username'] == handle]
-        if len(row_all) == 0:
-            return '-', '-', '-'
-        avg_ctr  = f"{row_all['avg_ctr'].mean()*100:.2f}%"
-        avg_ctor = f"{row_all['avg_ctor'].mean()*100:.2f}%"
-        avg_rpm  = f"${row_all['avg_rpm'].mean():.2f}"
-        return avg_ctr, avg_ctor, avg_rpm
-    avg_ctr  = f"{row['avg_ctr'].values[0]*100:.2f}%"
-    avg_ctor = f"{row['avg_ctor'].values[0]*100:.2f}%"
-    avg_rpm  = f"${row['avg_rpm'].values[0]:.2f}"
-    return avg_ctr, avg_ctor, avg_rpm
+    if len(row) > 0:
+        return (row['avg_ctr'].values[0],
+                row['avg_ctor'].values[0],
+                row['avg_rpm'].values[0],
+                True)  # True = 有该品类精确数据
+
+    # 没有该品类，用跨品类整体均值
+    row_all = profile_by_cat[profile_by_cat['Creator username'] == handle]
+    if len(row_all) > 0:
+        return (row_all['avg_ctr'].mean(),
+                row_all['avg_ctor'].mean(),
+                row_all['avg_rpm'].mean(),
+                False)  # False = 跨品类均值
+
+    return None, None, None, False
+
+# ==================== CTR分位数（用于判断强弱）====================
+@st.cache_data
+def get_ctr_threshold(_profile_by_cat):
+    """计算全量达人CTR的前30%分位线"""
+    if _profile_by_cat is None:
+        return 0.03  # 默认3%
+    overall_ctr = _profile_by_cat.groupby('Creator username')['avg_ctr'].mean()
+    return overall_ctr.quantile(0.70)  # 前30%的门槛
+
+ctr_threshold = get_ctr_threshold(profile_by_cat)
+
+# ==================== 推荐标签判断 ====================
+def get_recommendation_tag(category_preference, avg_ctr, is_category_specific, ctr_threshold):
+    """
+    三档逻辑：
+    1. 有品类历史数据 → 无标注
+    2. 无品类历史数据 + CTR强（前30%）→ 新品类可尝试
+    3. 无品类历史数据 + 无/弱CTR → 数据不足
+    """
+    if category_preference > 0:
+        return ""  # 正常，不加标注
+
+    if avg_ctr is not None and avg_ctr >= ctr_threshold:
+        return "🌟 新品类，内容能力强，可尝试"
+    else:
+        return "⚠️ 数据不足，仅供参考"
 
 # ==================== 执行推荐 ====================
 if st.button("🚀 开始匹配", type="primary"):
@@ -130,38 +152,47 @@ if st.button("🚀 开始匹配", type="primary"):
 
     st.subheader(f"🏆 Top {top_n} 推荐达人")
 
-    # 构造展示表格
     rows = []
     for _, row in result.iterrows():
         handle = row['handle']
-        ctr, ctor, rpm = get_content_metrics(handle, category, profile_by_cat)
+        avg_ctr, avg_ctor, avg_rpm, is_cat_specific = get_content_metrics(
+            handle, category, profile_by_cat
+        )
 
-        # 判断CTR数据来源
-        has_cat_data = profile_by_cat is not None and len(
-            profile_by_cat[
-                (profile_by_cat['Creator username'] == handle) &
-                (profile_by_cat['category'] == category)
-            ]
-        ) > 0
-        ctr_note = "" if has_cat_data else "（跨品类均值）" if ctr != '-' else ""
+        tag = get_recommendation_tag(
+            row['category_preference'], avg_ctr, is_cat_specific, ctr_threshold
+        )
+
+        # 格式化显示
+        ctr_display  = f"{avg_ctr*100:.2f}%" if avg_ctr is not None else "-"
+        ctor_display = f"{avg_ctor*100:.2f}%" if avg_ctor is not None else "-"
+        rpm_display  = f"${avg_rpm:.2f}" if avg_rpm is not None else "-"
+
+        # CTR来源备注
+        if avg_ctr is not None and not is_cat_specific and row['category_preference'] == 0:
+            ctr_display += "（跨品类均值）"
 
         rows.append({
-            '达人账号':       handle,
-            '匹配分':         f"{row['matching_score']:.3f}",
-            '品类偏好度':     f"{row['category_preference']*100:.1f}%",
-            '历史带货均值':   f"${row['creator_avg_gmv']:.1f}",
-            '历史订单数':     int(row['creator_order_count']),
-            'CTR（点击率）':  ctr + ctr_note,
-            'CTOR（转化率）': ctor,
-            'RPM（千次收益）':rpm,
+            '达人账号':        handle,
+            '匹配分':          f"{row['matching_score']:.3f}",
+            '品类偏好度':      f"{row['category_preference']*100:.1f}%",
+            '历史带货均值':    f"${row['creator_avg_gmv']:.1f}",
+            '历史订单数':      int(row['creator_order_count']),
+            'CTR（点击率）':   ctr_display,
+            'CTOR（转化率）':  ctor_display,
+            'RPM（千次收益）': rpm_display,
+            '推荐备注':        tag,
         })
 
     display_df = pd.DataFrame(rows)
     st.dataframe(display_df, use_container_width=True)
 
-    # 说明
-    st.caption(
-        "📌 匹配分：模型预测该达人带此类商品表现优于同品类平均的概率（0-1，越高越好）\n\n"
-        "📌 CTR/CTOR/RPM：来自视频数据，反映该达人的内容效率。'-'表示暂无视频数据；"
-        "标注'跨品类均值'表示该达人在此品类无视频记录，显示的是其所有品类的平均值。"
+    # 图例说明
+    st.markdown("---")
+    st.markdown(
+        "**图例说明**\n\n"
+        "- **匹配分**：模型预测该达人带此类商品表现优于同品类均值的概率（0–1，越高越好）\n"
+        "- **CTR/CTOR/RPM**：来自视频数据，反映内容效率。`-` 表示暂无视频数据\n"
+        "- 🌟 **新品类，内容能力强，可尝试**：该达人虽无此品类带货记录，但整体内容转化能力位于前30%\n"
+        "- ⚠️ **数据不足，仅供参考**：无品类历史数据且内容效率数据缺失或偏低，建议人工核查"
     )
