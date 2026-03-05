@@ -50,14 +50,15 @@ st.divider()
 
 # ==================== 输入区 ====================
 st.subheader("商品信息")
-col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
 
+# 第一行：品类 + 基础参数
+col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
 with col1:
     CATEGORIES = ['skincare', 'beauty', 'womenswear', 'fashion', 'home',
                   'food', 'fitness', 'tech', 'toy', 'pet',
                   'menswear', 'health', 'tools', 'book', 'other']
-    category = st.selectbox("品类", CATEGORIES)
-
+    category = st.selectbox("品类（Broad Category）", CATEGORIES,
+                             help="选择商品所属的大品类，用于模型匹配")
 with col2:
     price = st.number_input("定价（$）", min_value=1.0, max_value=500.0,
                              value=30.0, step=1.0)
@@ -66,6 +67,24 @@ with col3:
                                   value=15.0, step=0.5)
 with col4:
     top_n = st.number_input("推荐达人数", min_value=1, max_value=10, value=5, step=1)
+
+# 第二行：品牌定位 + 内容风格（规则过滤层，暂为辅助展示）
+with st.expander("品牌定位与内容风格（可选，用于推荐理由生成）"):
+    col_a, col_b = st.columns(2)
+    with col_a:
+        brand_type = st.selectbox(
+            "品牌定位类型",
+            ["不指定", "成分型（Ingredient-led）", "生活方式型（Lifestyle）",
+             "底妆/视觉型（Makeup-Visual）", "套装性价比型（Bundle-Value）"],
+            help="影响推荐理由中的内容匹配描述；后续版本将用于达人过滤"
+        )
+    with col_b:
+        content_style = st.selectbox(
+            "期望内容风格",
+            ["不指定", "教育科普（Educational）", "Before & After 对比",
+             "GRWM / 日常 Routine", "质感展示（Texture/Aesthetic）", "色号对比（Shade Match）"],
+            help="影响推荐理由中的内容匹配描述；后续版本将用于达人过滤"
+        )
 
 run = st.button("开始匹配", type="primary", use_container_width=False)
 
@@ -182,27 +201,46 @@ def score_color(score):
 # ==================== 推荐函数 ====================
 def recommend(category, price, commission_rate, top_n, df, model, feature_cols,
               profile_by_cat, global_medians):
-    df_settled = df[df['order_status'] == '已结算'].copy()
 
-    creator_stats = df_settled.groupby('handle').agg(
-        creator_avg_gmv     = ('gmv',             'mean'),
-        creator_median_gmv  = ('gmv',             'median'),
-        creator_std_gmv     = ('gmv',             'std'),
-        creator_order_count = ('order_id',        'count'),
-        creator_avg_comm    = ('commission_rate', 'mean'),
-        creator_avg_eng     = ('engagement_rate', 'mean'),
-        creator_video_flag  = ('engagement_rate', lambda x: x.notna().mean()),
-    ).reset_index()
+    # 列名兼容：同时支持新版（英文）和旧版（中文）creator_data.pkl
+    STATUS_COL = 'order_status' if 'order_status' in df.columns else '订单状态'
+    GMV_COL    = 'gmv'          if 'gmv'          in df.columns else '该商品GMV'
+    COMM_COL   = 'commission_rate' if 'commission_rate' in df.columns else '佣金率'
+    OID_COL    = 'order_id'     if 'order_id'     in df.columns else '订单id'
+    ENG_COL    = 'engagement_rate' if 'engagement_rate' in df.columns else None
+    SETTLED    = '已结算'
+
+    df_settled = df[df[STATUS_COL] == SETTLED].copy()
+
+    agg_dict = {
+        'creator_avg_gmv':     (GMV_COL,  'mean'),
+        'creator_median_gmv':  (GMV_COL,  'median'),
+        'creator_std_gmv':     (GMV_COL,  'std'),
+        'creator_order_count': (OID_COL,  'count'),
+        'creator_avg_comm':    (COMM_COL, 'mean'),
+    }
+    if ENG_COL and ENG_COL in df_settled.columns:
+        agg_dict['creator_avg_eng']   = (ENG_COL, 'mean')
+        agg_dict['creator_video_flag']= (ENG_COL, lambda x: x.notna().mean())
+
+    creator_stats = df_settled.groupby('handle').agg(**agg_dict).reset_index()
+    if 'creator_avg_eng' not in creator_stats.columns:
+        creator_stats['creator_avg_eng']    = 0.0
+        creator_stats['creator_video_flag'] = 0.0
     creator_stats['creator_std_gmv'] = creator_stats['creator_std_gmv'].fillna(0)
-    creator_stats['creator_avg_eng'] = creator_stats['creator_avg_eng'].fillna(
-        df_settled['engagement_rate'].mean()
-    )
+    if ENG_COL and ENG_COL in df_settled.columns:
+        creator_stats['creator_avg_eng'] = creator_stats['creator_avg_eng'].fillna(
+            df_settled[ENG_COL].mean()
+        )
+    else:
+        creator_stats['creator_avg_eng'] = creator_stats['creator_avg_eng'].fillna(0)
 
-    cat_count   = df_settled.groupby(['handle', 'category']).size().reset_index(name='cat_count')
+    CAT_COL = 'category' if 'category' in df_settled.columns else '品类'
+    cat_count   = df_settled.groupby(['handle', CAT_COL]).size().reset_index(name='cat_count')
     total_count = df_settled.groupby('handle').size().reset_index(name='total_count')
     cat_pref    = cat_count.merge(total_count, on='handle')
     cat_pref['cat_preference'] = cat_pref['cat_count'] / cat_pref['total_count']
-    cat_pref_f  = cat_pref[cat_pref['category'] == category][['handle', 'cat_preference']]
+    cat_pref_f  = cat_pref[cat_pref[CAT_COL] == category][['handle', 'cat_preference']]
 
     candidates = creator_stats.merge(cat_pref_f, on='handle', how='left')
     candidates['cat_preference'] = candidates['cat_preference'].fillna(0)
