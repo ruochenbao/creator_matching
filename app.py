@@ -5,6 +5,18 @@ import numpy as np
 
 st.set_page_config(page_title="达人匹配系统", layout="wide")
 
+# ==================== 全局样式：缩小 metric 字体 ====================
+st.markdown("""
+<style>
+/* metric 数值字体缩小 */
+[data-testid="stMetricValue"] { font-size: 1.05rem !important; }
+/* metric 标签字体缩小 */
+[data-testid="stMetricLabel"] { font-size: 0.70rem !important; color: #6b6b6b; }
+/* metric 容器内边距收紧 */
+[data-testid="stMetric"] { padding-top: 4px !important; padding-bottom: 4px !important; }
+</style>
+""", unsafe_allow_html=True)
+
 # ==================== 加载模型文件 ====================
 @st.cache_resource
 def load_model():
@@ -203,13 +215,21 @@ def apply_rules(candidates, brand_type, min_ctr_pct, cat_exp, is_new_launch, cat
 
     removed_count = original_count - len(df)
 
-    # ---- 软重排序：品牌定位 ----
+    # ---- 软重排序：基础层（始终生效）----
+    # matching_score 和 cat_preference 本身都在 [0,1]，直接加权相加
+    # 不做 norm_series：避免 norm 把分布拉伸后反而放大 price_deviation 的影响
+    # 权重：模型分 70%，品类专长 30%
+    # 解决问题：模型倾向于价格匹配（price_deviation 权重高），
+    #           导致价格带偏低的品类专家（如高偏好度 skincare 达人）排名靠后
     boost_label = None
     df['final_score'] = df['matching_score'].copy()
 
     if len(df) > 1:
-        base_norm = norm_series(df['matching_score'])
+        # base = 模型分（反映价格/历史综合能力）+ 品类专长补偿
+        base = 0.70 * df['matching_score'] + 0.30 * df['cat_preference']
+        df['final_score'] = base
 
+        # ---- 软重排序：品牌定位（叠加在 base 之上，用 norm 对齐量纲）----
         if brand_type != "不指定":
             if "成分型" in brand_type:
                 boost = norm_series(df['feat_ctor'])
@@ -227,13 +247,12 @@ def apply_rules(candidates, brand_type, min_ctr_pct, cat_exp, is_new_launch, cat
                 boost = None
 
             if boost is not None:
-                df['final_score'] = 0.65 * base_norm + 0.35 * boost
-                base_norm = df['final_score']  # 更新 base，供新品叠加
+                df['final_score'] = 0.65 * norm_series(base) + 0.35 * boost
 
         # ---- 软重排序：新品冷启动 ----
         if is_new_launch:
             eng_boost = norm_series(df['creator_avg_eng'])
-            df['final_score'] = 0.70 * base_norm + 0.30 * eng_boost
+            df['final_score'] = 0.70 * df['final_score'] + 0.30 * eng_boost
             if boost_label:
                 boost_label = boost_label + " + 互动率（新品加权）"
             else:
@@ -419,13 +438,13 @@ if run:
     st.subheader(f"推荐结果  ·  {category}  /  ${price:.0f}  /  佣金 {commission:.1f}%")
 
     # --- 过滤与重排序状态提示 ---
-    info_parts = [f"共推荐 **{len(result)}** 位达人，按{'综合评分' if boost_label else '匹配分'}从高到低排列"]
+    info_parts = [f"共推荐 **{len(result)}** 位达人，按综合评分从高到低排列"]
     if removed_count > 0:
         info_parts.append(f"硬过滤移除 **{removed_count}** 位不达标达人（{' / '.join(filter_msgs)}）")
     if boost_label:
-        info_parts.append(f"软重排序已启用：模型分 65% + **{boost_label}** 35%")
-    if is_new_launch and not boost_label:
-        info_parts.append("新品冷启动加权：模型分 70% + 互动率 30%")
+        info_parts.append(f"品牌定位加权：基础分 65% + **{boost_label}** 35%")
+    if is_new_launch:
+        info_parts.append("新品冷启动加权已叠加（互动率 +30%）")
     for msg in info_parts:
         st.caption(msg)
 
@@ -449,17 +468,11 @@ if run:
             with h_col:
                 st.markdown(f"### #{rank+1} &nbsp; `@{handle}`")
             with s_col:
-                if boost_label or is_new_launch:
-                    st.markdown(
-                        f"**综合分** &nbsp; {score_color(f_score)} &nbsp; "
-                        f"`{score_bar(f_score)}` &nbsp; **{f_score:.3f}**"
-                        f"&nbsp;&nbsp; *(模型匹配分 {score:.3f})*"
-                    )
-                else:
-                    st.markdown(
-                        f"**匹配分** &nbsp; {score_color(score)} &nbsp; "
-                        f"`{score_bar(score)}` &nbsp; **{score:.3f}**"
-                    )
+                extra = f"&nbsp; *(模型原始分 {score:.3f})*" if (boost_label or is_new_launch) else ""
+                st.markdown(
+                    f"**综合分** &nbsp; {score_color(f_score)} &nbsp; "
+                    f"`{score_bar(f_score)}` &nbsp; **{f_score:.3f}**{extra}"
+                )
 
             # --- 行2：核心指标 ---
             m1, m2, m3, m4 = st.columns(4)
@@ -476,8 +489,8 @@ if run:
                 st.metric("互动率（均值）", eng_s,
                           help="历史视频（点赞+评论+分享）÷ 观看数 的平均值")
 
-            # --- 行3：内容效率 ---
-            c1, c2, c3, c_note = st.columns([1, 1, 1, 2])
+            # --- 行3：内容效率（与行2等宽对齐）---
+            c1, c2, c3, c_note = st.columns(4)
             with c1:
                 st.metric("CTR 点击率", ctr_s, help="视频被点击进商品详情页的比率")
             with c2:
@@ -485,19 +498,20 @@ if run:
             with c3:
                 st.metric("RPM 千次收益", rpm_s, help="每千次视频播放产生的 GMV")
             with c_note:
+                st.write("")  # 占位
                 if data_src == 'overall':
-                    st.caption("⚠️ 该品类暂无视频记录，显示的是跨品类均值")
+                    st.caption("⚠️ 跨品类均值（无该品类视频记录）")
                 elif data_src == 'no_data':
                     st.caption("⚠️ 暂无视频效率数据")
                 else:
-                    st.caption(f"✅ 数据来自该达人 {category} 品类的实际视频记录")
+                    st.caption(f"✅ {category} 品类实际视频数据")
 
             # --- 行4：推荐理由 ---
             st.markdown("**推荐理由：** " + "　".join(tags))
 
     st.divider()
     st.caption(
-        "**匹配分**：模型预测该达人带此品类商品表现优于同品类平均的概率（0–1）  \n"
-        "**综合分**（启用定位/新品时）：模型分 × 65% + 品牌定位信号 × 35%，新品再叠加互动率权重  \n"
+        "**综合分**：模型预测分（70%）× 品类专长（30%）；启用品牌定位时进一步加权对应信号  \n"
+        "模型预测分：预测该达人带此品类商品 GMV 高于品类中位数的概率（0–1）  \n"
         "CTR / CTOR / RPM 使用贝叶斯平滑处理，视频数越少的达人越向品类全局均值回归"
     )
