@@ -3,6 +3,8 @@ import joblib
 import pandas as pd
 import numpy as np
 
+st.set_page_config(page_title="达人匹配系统", layout="wide")
+
 # ==================== 加载模型文件 ====================
 @st.cache_resource
 def load_model():
@@ -23,205 +25,278 @@ def load_content_profile():
 try:
     model, FEATURE_COLS, df = load_model()
     profile_by_cat, profile_overall = load_content_profile()
-    st.success("模型加载成功！")
 except Exception as e:
     st.error(f"模型文件加载失败：{e}")
     st.stop()
 
+# 预计算品类全局中位数（推理时对无视频数据达人的 CTR 填充用）
+@st.cache_resource
+def compute_global_medians(_profile_by_cat):
+    if _profile_by_cat is None:
+        return {}
+    gm = _profile_by_cat.groupby('category').agg(
+        global_ctr  = ('avg_ctr',  'median'),
+        global_ctor = ('avg_ctor', 'median'),
+        global_rpm  = ('avg_rpm',  'median'),
+    ).reset_index()
+    return gm.set_index('category').to_dict('index')
+
+global_medians = compute_global_medians(profile_by_cat)
+
 # ==================== 页面标题 ====================
-st.title("🎯 达人-商品匹配推荐系统")
-st.markdown("输入商品信息，自动推荐最匹配的达人，并附上内容效率参考数据。")
+st.title("达人-商品匹配推荐系统")
+st.caption("输入商品信息，模型自动推荐最匹配的达人，并附上推荐理由和内容效率数据。")
+st.divider()
 
 # ==================== 输入区 ====================
-st.subheader("📦 商品信息输入")
-
-col1, col2, col3 = st.columns(3)
+st.subheader("商品信息")
+col1, col2, col3, col4 = st.columns([2, 1, 1, 1])
 
 with col1:
     CATEGORIES = ['skincare', 'beauty', 'womenswear', 'fashion', 'home',
                   'food', 'fitness', 'tech', 'toy', 'pet',
                   'menswear', 'health', 'tools', 'book', 'other']
-    category = st.selectbox("商品品类", CATEGORIES)
+    category = st.selectbox("品类", CATEGORIES)
 
 with col2:
-    price = st.number_input("商品定价（$）", min_value=1.0, max_value=500.0,
+    price = st.number_input("定价（$）", min_value=1.0, max_value=500.0,
                              value=30.0, step=1.0)
-
 with col3:
     commission = st.number_input("佣金率（%）", min_value=1.0, max_value=50.0,
                                   value=15.0, step=0.5)
+with col4:
+    top_n = st.number_input("推荐达人数", min_value=1, max_value=10, value=5, step=1)
 
-top_n = st.slider("推荐达人数量", min_value=1, max_value=10, value=5)
+run = st.button("开始匹配", type="primary", use_container_width=False)
 
-# ==================== 推荐函数 ====================
-def recommend(category, price, commission_rate, top_n, df, model, feature_cols):
-    df_settled = df[df['订单状态'] == '已结算'].copy()
-    # 兼容新旧pkl：统一列名
-    if '品类' in df_settled.columns and 'category' not in df_settled.columns:
-        df_settled = df_settled.rename(columns={'品类': 'category'})
-
-    creator_stats = df_settled.groupby('handle').agg(
-        creator_avg_gmv        = ('该商品GMV', 'mean'),
-        creator_median_gmv     = ('该商品GMV', 'median'),
-        creator_std_gmv        = ('该商品GMV', 'std'),
-        creator_order_count    = ('订单id',    'count'),
-        creator_avg_commission = ('佣金率',    'mean'),
-    ).reset_index()
-    creator_stats['creator_std_gmv'] = creator_stats['creator_std_gmv'].fillna(0)
-
-    # 品类偏好度
-    cat_count   = df_settled.groupby(['handle', 'category']).size().reset_index(name='cat_count')
-    total_count = df_settled.groupby('handle').size().reset_index(name='total_count')
-    cat_pref    = cat_count.merge(total_count, on='handle')
-    cat_pref['cat_preference'] = cat_pref['cat_count'] / cat_pref['total_count']
-    cat_pref_filtered = cat_pref[cat_pref['category'] == category][['handle', 'cat_preference']]
-
-    candidates = creator_stats.merge(cat_pref_filtered, on='handle', how='left')
-    candidates['cat_preference'] = candidates['cat_preference'].fillna(0)
-
-    # 达人在该品类的历史GMV均值
-    cat_stats = df_settled[df_settled['category'] == category].groupby('handle').agg(
-        cat_avg_gmv     = ('该商品GMV', 'mean'),
-        cat_std_gmv     = ('该商品GMV', 'std'),
-        cat_order_count = ('订单id',    'count'),
-    ).reset_index()
-    cat_stats['cat_std_gmv'] = cat_stats['cat_std_gmv'].fillna(0)
-
-    candidates = candidates.merge(cat_stats, on='handle', how='left')
-    candidates['cat_avg_gmv']     = candidates['cat_avg_gmv'].fillna(candidates['creator_avg_gmv'])
-    candidates['cat_std_gmv']     = candidates['cat_std_gmv'].fillna(candidates['creator_std_gmv'])
-    candidates['cat_order_count'] = candidates['cat_order_count'].fillna(0)
-    candidates['cat_vs_overall']  = candidates['cat_avg_gmv'] - candidates['creator_avg_gmv']
-
-    # 商品特征
-    candidates['current_commission']   = commission_rate
-    candidates['current_qty']          = 1
-    candidates['price_deviation']      = (price - candidates['creator_avg_gmv']) / (candidates['creator_avg_gmv'] + 0.01)
-    candidates['commission_deviation'] = commission_rate - candidates['creator_avg_commission']
-    candidates['log_gmv']              = np.log1p(price)
-    candidates['hour']                 = 12
-    candidates['weekday']              = 1
-
-    for col in feature_cols:
-        if col not in candidates.columns:
-            candidates[col] = 0
-
-    X = candidates[feature_cols].fillna(0)
-    candidates['matching_score']      = model.predict_proba(X)[:, 1]
-    candidates['category_preference'] = candidates['cat_preference']
-
-    result = candidates.sort_values('matching_score', ascending=False).head(top_n)
-    return result
-
-# ==================== 内容效率查询 ====================
-def get_content_metrics(handle, category, profile_by_cat):
-    """返回：avg_ctr(float或None), avg_ctor(float或None), avg_rpm(float或None), is_category_specific(bool)"""
+# ==================== 工具函数 ====================
+def get_feat_ctr(handle, category, profile_by_cat, global_medians):
+    """返回用于模型特征的 feat_ctr/ctor/rpm（数值）"""
+    gm = global_medians.get(category, {})
+    fallback = (gm.get('global_ctr', 0.01), gm.get('global_ctor', 0.01), gm.get('global_rpm', 5.0))
     if profile_by_cat is None:
-        return None, None, None, False
-
-    # 先找达人+品类的精确数据
+        return fallback
     row = profile_by_cat[
         (profile_by_cat['Creator username'] == handle) &
         (profile_by_cat['category'] == category)
     ]
     if len(row) > 0:
-        return (row['avg_ctr'].values[0],
-                row['avg_ctor'].values[0],
-                row['avg_rpm'].values[0],
-                True)  # True = 有该品类精确数据
-
-    # 没有该品类，用跨品类整体均值
+        return row['avg_ctr'].values[0], row['avg_ctor'].values[0], row['avg_rpm'].values[0]
     row_all = profile_by_cat[profile_by_cat['Creator username'] == handle]
     if len(row_all) > 0:
-        return (row_all['avg_ctr'].mean(),
-                row_all['avg_ctor'].mean(),
-                row_all['avg_rpm'].mean(),
-                False)  # False = 跨品类均值
+        w = row_all['video_count']
+        wsum = w.sum()
+        if wsum > 0:
+            return (
+                (row_all['avg_ctr']  * w).sum() / wsum,
+                (row_all['avg_ctor'] * w).sum() / wsum,
+                (row_all['avg_rpm']  * w).sum() / wsum,
+            )
+    return fallback
 
-    return None, None, None, False
 
-# ==================== CTR分位数（用于判断强弱）====================
-@st.cache_data
-def get_ctr_threshold(_profile_by_cat):
-    """计算全量达人CTR的前30%分位线"""
-    if _profile_by_cat is None:
-        return 0.03  # 默认3%
-    overall_ctr = _profile_by_cat.groupby('Creator username')['avg_ctr'].mean()
-    return overall_ctr.quantile(0.70)  # 前30%的门槛
+def get_content_display(handle, category, profile_by_cat):
+    """返回展示用的 CTR/CTOR/RPM 字符串 + 数据来源标注"""
+    if profile_by_cat is None:
+        return '-', '-', '-', 'no_data'
+    row = profile_by_cat[
+        (profile_by_cat['Creator username'] == handle) &
+        (profile_by_cat['category'] == category)
+    ]
+    if len(row) > 0:
+        return (
+            f"{row['avg_ctr'].values[0]*100:.2f}%",
+            f"{row['avg_ctor'].values[0]*100:.2f}%",
+            f"${row['avg_rpm'].values[0]:.2f}",
+            'exact',
+        )
+    row_all = profile_by_cat[profile_by_cat['Creator username'] == handle]
+    if len(row_all) > 0:
+        return (
+            f"{row_all['avg_ctr'].mean()*100:.2f}%",
+            f"{row_all['avg_ctor'].mean()*100:.2f}%",
+            f"${row_all['avg_rpm'].mean():.2f}",
+            'overall',
+        )
+    return '-', '-', '-', 'no_data'
 
-ctr_threshold = get_ctr_threshold(profile_by_cat)
 
-# ==================== 推荐标签判断 ====================
-def get_recommendation_tag(category_preference, avg_ctr, is_category_specific, ctr_threshold):
-    """
-    三档逻辑：
-    1. 有品类历史数据 → 无标注
-    2. 无品类历史数据 + CTR强（前30%）→ 新品类可尝试
-    3. 无品类历史数据 + 无/弱CTR → 数据不足
-    """
-    if category_preference > 0:
-        return ""  # 正常，不加标注
+def generate_reason(row, category, price):
+    """根据特征值自动生成推荐理由标签"""
+    tags = []
 
-    if avg_ctr is not None and avg_ctr >= ctr_threshold:
-        return "🌟 新品类，内容能力强，可尝试"
+    # 品类偏好
+    pref = row['cat_preference']
+    if pref >= 0.3:
+        tags.append(f"🎯 该品类主力达人（偏好度 {pref*100:.0f}%）")
+    elif pref >= 0.1:
+        tags.append(f"✅ 有{category}带货经验（{pref*100:.0f}%）")
+
+    # 价格带匹配
+    dev = abs(row['creator_avg_gmv'] - price) / (price + 0.01)
+    if dev < 0.15:
+        tags.append(f"💰 价格带高度吻合（历史均值 ${row['creator_avg_gmv']:.0f}）")
+    elif dev < 0.35:
+        tags.append(f"💰 价格带接近（历史均值 ${row['creator_avg_gmv']:.0f}）")
+
+    # 内容效率
+    ctr = row['feat_ctr']
+    if ctr >= 0.02:
+        tags.append("📈 CTR 优秀（> 2%）")
+    elif ctr >= 0.01:
+        tags.append("📊 CTR 良好（> 1%）")
+
+    # 互动率
+    eng = row.get('creator_avg_eng', 0)
+    if pd.notna(eng) and eng >= 0.08:
+        tags.append("💬 视频互动率高")
+
+    # 带货经验量
+    cnt = row['creator_order_count']
+    if cnt >= 200:
+        tags.append(f"📦 带货订单丰富（{cnt:.0f} 条）")
+    elif cnt >= 50:
+        tags.append(f"📦 有稳定带货记录（{cnt:.0f} 条）")
+
+    if not tags:
+        tags.append("综合历史带货能力匹配")
+
+    return tags
+
+
+def score_bar(score):
+    """把 0-1 的分数转成 emoji 进度条"""
+    filled = round(score * 10)
+    return "█" * filled + "░" * (10 - filled)
+
+
+def score_color(score):
+    if score >= 0.6:
+        return "🟢"
+    elif score >= 0.4:
+        return "🟡"
     else:
-        return "⚠️ 数据不足，仅供参考"
+        return "🔴"
 
-# ==================== 执行推荐 ====================
-if st.button("🚀 开始匹配", type="primary"):
+
+# ==================== 推荐函数 ====================
+def recommend(category, price, commission_rate, top_n, df, model, feature_cols,
+              profile_by_cat, global_medians):
+    df_settled = df[df['order_status'] == '已结算'].copy()
+
+    creator_stats = df_settled.groupby('handle').agg(
+        creator_avg_gmv     = ('gmv',             'mean'),
+        creator_median_gmv  = ('gmv',             'median'),
+        creator_std_gmv     = ('gmv',             'std'),
+        creator_order_count = ('order_id',        'count'),
+        creator_avg_comm    = ('commission_rate', 'mean'),
+        creator_avg_eng     = ('engagement_rate', 'mean'),
+        creator_video_flag  = ('engagement_rate', lambda x: x.notna().mean()),
+    ).reset_index()
+    creator_stats['creator_std_gmv'] = creator_stats['creator_std_gmv'].fillna(0)
+    creator_stats['creator_avg_eng'] = creator_stats['creator_avg_eng'].fillna(
+        df_settled['engagement_rate'].mean()
+    )
+
+    cat_count   = df_settled.groupby(['handle', 'category']).size().reset_index(name='cat_count')
+    total_count = df_settled.groupby('handle').size().reset_index(name='total_count')
+    cat_pref    = cat_count.merge(total_count, on='handle')
+    cat_pref['cat_preference'] = cat_pref['cat_count'] / cat_pref['total_count']
+    cat_pref_f  = cat_pref[cat_pref['category'] == category][['handle', 'cat_preference']]
+
+    candidates = creator_stats.merge(cat_pref_f, on='handle', how='left')
+    candidates['cat_preference'] = candidates['cat_preference'].fillna(0)
+
+    candidates['price_deviation'] = (price - candidates['creator_avg_gmv']) / (candidates['creator_avg_gmv'] + 0.01)
+    candidates['commission_diff'] = commission_rate - candidates['creator_avg_comm']
+    candidates['log_gmv']         = np.log1p(price)
+    candidates['commission_rate'] = commission_rate
+    candidates['qty']             = 1
+    candidates['order_hour']      = 12
+    candidates['order_weekday']   = 2
+
+    feat = candidates['handle'].apply(
+        lambda h: get_feat_ctr(h, category, profile_by_cat, global_medians)
+    )
+    candidates['feat_ctr']  = [r[0] for r in feat]
+    candidates['feat_ctor'] = [r[1] for r in feat]
+    candidates['feat_rpm']  = [r[2] for r in feat]
+
+    X = candidates[feature_cols].fillna(0)
+    candidates['matching_score'] = model.predict_proba(X)[:, 1]
+
+    return candidates.sort_values('matching_score', ascending=False).head(top_n).reset_index(drop=True)
+
+
+# ==================== 展示推荐结果（卡片式） ====================
+if run:
     with st.spinner("匹配中..."):
-        result = recommend(category, price, commission, top_n, df, model, FEATURE_COLS)
-
-    st.subheader(f"🏆 Top {top_n} 推荐达人")
-    # 当所有推荐达人品类偏好度都为0时，显示提示
-    if (result['category_preference'] == 0).all():
-        st.warning(
-            f"⚠️ 当前达人库中暂无 **{category}** 品类的历史带货数据，"
-            "以下推荐仅基于价格带匹配，区分度有限。建议结合「推荐备注」列的内容效率数据进行人工判断。"
+        result = recommend(
+            category, price, commission, top_n,
+            df, model, FEATURE_COLS,
+            profile_by_cat, global_medians
         )
 
-    rows = []
-    for _, row in result.iterrows():
+    st.divider()
+    st.subheader(f"推荐结果  ·  {category}  /  ${price:.0f}  /  佣金 {commission:.1f}%")
+    st.caption(f"共推荐 {len(result)} 位达人，按匹配分从高到低排列")
+
+    for rank, row in result.iterrows():
         handle = row['handle']
-        avg_ctr, avg_ctor, avg_rpm, is_cat_specific = get_content_metrics(
-            handle, category, profile_by_cat
-        )
+        score  = row['matching_score']
+        ctr_s, ctor_s, rpm_s, data_src = get_content_display(handle, category, profile_by_cat)
+        tags = generate_reason(row, category, price)
 
-        tag = get_recommendation_tag(
-            row['category_preference'], avg_ctr, is_cat_specific, ctr_threshold
-        )
+        eng = row.get('creator_avg_eng', float('nan'))
+        eng_s = f"{eng*100:.1f}%" if pd.notna(eng) and eng > 0 else '-'
 
-        # 格式化显示
-        ctr_display  = f"{avg_ctr*100:.2f}%" if avg_ctr is not None else "-"
-        ctor_display = f"{avg_ctor*100:.2f}%" if avg_ctor is not None else "-"
-        rpm_display  = f"${avg_rpm:.2f}" if avg_rpm is not None else "-"
+        with st.container(border=True):
+            # --- 行1：账号 + 匹配分 ---
+            h_col, s_col = st.columns([3, 2])
+            with h_col:
+                st.markdown(f"### #{rank+1} &nbsp; `@{handle}`")
+            with s_col:
+                st.markdown(
+                    f"**匹配分** &nbsp; {score_color(score)} &nbsp; "
+                    f"`{score_bar(score)}` &nbsp; **{score:.3f}**"
+                )
 
-        # CTR来源备注
-        if avg_ctr is not None and not is_cat_specific and row['category_preference'] == 0:
-            ctr_display += "（跨品类均值）"
+            # --- 行2：核心指标 ---
+            m1, m2, m3, m4 = st.columns(4)
+            with m1:
+                st.metric("品类偏好度", f"{row['cat_preference']*100:.1f}%",
+                          help="该达人历史已结算订单中，此品类占比")
+            with m2:
+                st.metric("历史带货均值", f"${row['creator_avg_gmv']:.1f}",
+                          help="达人历史已结算订单的平均 GMV")
+            with m3:
+                st.metric("历史订单数", f"{int(row['creator_order_count'])} 条",
+                          help="已结算订单总数，反映带货经验量")
+            with m4:
+                st.metric("互动率（均值）", eng_s,
+                          help="历史视频（点赞+评论+分享）÷ 观看数 的平均值")
 
-        rows.append({
-            '达人账号':        handle,
-            '匹配分':          f"{row['matching_score']:.3f}",
-            '品类偏好度':      f"{row['category_preference']*100:.1f}%",
-            '历史带货均值':    f"${row['creator_avg_gmv']:.1f}",
-            '历史订单数':      int(row['creator_order_count']),
-            'CTR（点击率）':   ctr_display,
-            'CTOR（转化率）':  ctor_display,
-            'RPM（千次收益）': rpm_display,
-            '推荐备注':        tag,
-        })
+            # --- 行3：内容效率 ---
+            c1, c2, c3, c_note = st.columns([1, 1, 1, 2])
+            with c1:
+                st.metric("CTR 点击率", ctr_s, help="视频被点击进商品详情页的比率")
+            with c2:
+                st.metric("CTOR 转化率", ctor_s, help="点击后下单的比率")
+            with c3:
+                st.metric("RPM 千次收益", rpm_s, help="每千次视频播放产生的 GMV")
+            with c_note:
+                if data_src == 'overall':
+                    st.caption("⚠️ 该品类暂无视频记录，显示的是跨品类均值")
+                elif data_src == 'no_data':
+                    st.caption("⚠️ 暂无视频效率数据")
+                else:
+                    st.caption(f"✅ 数据来自该达人 {category} 品类的实际视频记录")
 
-    display_df = pd.DataFrame(rows)
-    display_df.index = range(1, len(display_df) + 1)
-    st.dataframe(display_df, use_container_width=True)
+            # --- 行4：推荐理由 ---
+            st.markdown("**推荐理由：** " + "　".join(tags))
 
-    # 图例说明
-    st.markdown("---")
-    st.markdown(
-        "**图例说明**\n\n"
-        "- **匹配分**：模型预测该达人带此类商品表现优于同品类均值的概率（0–1，越高越好）\n"
-        "- **CTR/CTOR/RPM**：来自视频数据，反映内容效率。`-` 表示暂无视频数据\n"
-        "- 🌟 **新品类，内容能力强，可尝试**：该达人虽无此品类带货记录，但整体内容转化能力位于前30%\n"
-        "- ⚠️ **数据不足，仅供参考**：无品类历史数据且内容效率数据缺失或偏低，建议人工核查"
+    st.divider()
+    st.caption(
+        "匹配分说明：模型预测该达人带此品类商品表现优于同品类平均的概率（0–1）\n\n"
+        "CTR/CTOR/RPM 使用贝叶斯平滑处理，视频数越少的达人越向品类全局均值回归"
     )
