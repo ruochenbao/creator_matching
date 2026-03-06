@@ -2,6 +2,7 @@ import streamlit as st
 import joblib
 import pandas as pd
 import numpy as np
+import io
 
 st.set_page_config(page_title="达人匹配系统", layout="wide")
 
@@ -9,11 +10,19 @@ st.set_page_config(page_title="达人匹配系统", layout="wide")
 st.markdown("""
 <style>
 /* metric 数值字体缩小 */
-[data-testid="stMetricValue"] { font-size: 1.05rem !important; }
+[data-testid="stMetricValue"] { font-size: 1.0rem !important; }
 /* metric 标签字体缩小 */
-[data-testid="stMetricLabel"] { font-size: 0.70rem !important; color: #6b6b6b; }
+[data-testid="stMetricLabel"] { font-size: 0.68rem !important; color: #6b6b6b; }
 /* metric 容器内边距收紧 */
-[data-testid="stMetric"] { padding-top: 4px !important; padding-bottom: 4px !important; }
+[data-testid="stMetric"] { padding-top: 2px !important; padding-bottom: 2px !important; }
+/* 卡片内部元素行间距压缩 */
+[data-testid="stVerticalBlockBorderWrapper"] > div > div {
+    gap: 0.25rem !important;
+}
+/* 卡片自身上下外边距缩小 */
+[data-testid="stVerticalBlockBorderWrapper"] {
+    margin-bottom: 0.3rem !important;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -121,6 +130,15 @@ with st.expander("筛选与定位条件（可选）", expanded=False):
                 "主力达人：该品类占历史订单 ≥ 30%"
             )
         )
+
+    st.divider()
+    st.caption("**扩展候选池（可选）**：上传 Fastmoss 带货达人榜 Excel，可在模型库之外发现更多候选达人")
+    fm_file = st.file_uploader(
+        "Fastmoss 达人榜 Excel",
+        type=['xlsx'],
+        label_visibility='collapsed',
+        help="从 Fastmoss「带货达人榜」页面导出的 Excel 文件，用于扩展推荐候选池"
+    )
 
 run = st.button("开始匹配", type="primary", use_container_width=False)
 
@@ -348,6 +366,66 @@ def score_color(score):
         return "🔴"
 
 
+def load_fm_pool(uploaded_file):
+    """
+    加载 Fastmoss 带货达人榜 Excel，返回规则评分后的 DataFrame。
+    列顺序固定：昵称/达人ID/性别/分类/粉丝数/商品数/总GMV/视频GMV/直播GMV/fm链接/tt链接
+    """
+    df = pd.read_excel(uploaded_file)
+    # 按位置重命名（避免编码乱码问题）
+    fixed_cols = ['nickname', 'handle', 'gender', 'category', 'followers',
+                  'product_count', 'total_gmv', 'video_gmv', 'live_gmv',
+                  'fastmoss_url', 'tiktok_url']
+    df.columns = fixed_cols[:len(df.columns)]
+
+    # 类型清理
+    df['handle']    = df['handle'].astype(str).str.strip()
+    df['nickname']  = df['nickname'].astype(str).str.strip()
+    df['total_gmv'] = pd.to_numeric(df['total_gmv'], errors='coerce').fillna(0)
+    df['video_gmv'] = pd.to_numeric(df['video_gmv'], errors='coerce').fillna(0)
+    df['live_gmv']  = pd.to_numeric(df['live_gmv'],  errors='coerce').fillna(0)
+    df['followers'] = pd.to_numeric(df['followers'],  errors='coerce').fillna(0)
+
+    # 过滤：只保留美妆相关类目
+    if 'category' in df.columns:
+        beauty_kw = ['美妆', '护肤', 'beauty', 'Beauty']
+        mask = df['category'].astype(str).str.contains('|'.join(beauty_kw), na=False)
+        df = df[mask].copy()
+
+    # 过滤：必须有视频带货 GMV（affiliate 友好）
+    df = df[df['video_gmv'] > 0].copy()
+
+    if len(df) == 0:
+        return df
+
+    # 规则评分 -------------------------------------------------------
+    # 1. 视频GMV占比（越高 = 越依赖有机内容，而非直播）
+    df['video_ratio'] = df['video_gmv'] / (df['total_gmv'] + 1)
+
+    # 2. 粉丝量级适配（偏好 5K-500K 腰部区间）
+    def _follower_score(f):
+        if   f <   5_000: return 0.25
+        elif f <  50_000: return 0.70
+        elif f < 200_000: return 1.00
+        elif f < 500_000: return 0.85
+        elif f < 2_000_000: return 0.60
+        else:               return 0.30
+    df['follower_score'] = df['followers'].apply(_follower_score)
+
+    # 3. 视频GMV量级（log 归一化带货经验）
+    log_max = np.log1p(df['video_gmv'].max()) or 1.0
+    df['gmv_score'] = np.log1p(df['video_gmv']) / log_max
+
+    # 综合分：视频占比40% + 粉丝适配35% + 经验25%
+    df['cold_score'] = (
+        0.40 * df['video_ratio'] +
+        0.35 * df['follower_score'] +
+        0.25 * df['gmv_score']
+    )
+
+    return df.sort_values('cold_score', ascending=False).reset_index(drop=True)
+
+
 # ==================== 推荐函数 ====================
 def recommend(category, price, commission_rate, df, model, feature_cols,
               profile_by_cat, global_medians):
@@ -434,7 +512,6 @@ if run:
     st.divider()
 
     # --- 结果标题行 ---
-    title_parts = [f"**{category}**", f"**${price:.0f}**", f"**佣金 {commission:.1f}%**"]
     st.subheader(f"推荐结果  ·  {category}  /  ${price:.0f}  /  佣金 {commission:.1f}%")
 
     # --- 过滤与重排序状态提示 ---
@@ -445,69 +522,198 @@ if run:
         info_parts.append(f"品牌定位加权：基础分 65% + **{boost_label}** 35%")
     if is_new_launch:
         info_parts.append("新品冷启动加权已叠加（互动率 +30%）")
-    for msg in info_parts:
-        st.caption(msg)
+
+    cap_col, dl_col = st.columns([4, 1])
+    with cap_col:
+        for msg in info_parts:
+            st.caption(msg)
 
     if len(result) == 0:
         st.warning("当前筛选条件下没有符合要求的达人，请放宽筛选条件后重试。")
         st.stop()
 
+    # ==================== 预收集展示数据（同时构建下载内容）====================
+    src_label = {'exact': '该品类实际数据', 'overall': '跨品类均值', 'no_data': '无数据'}
+    card_data = []
     for rank, row in result.iterrows():
-        handle   = row['handle']
-        score    = row['matching_score']
-        f_score  = row.get('final_score', score)
+        handle  = row['handle']
+        score   = row['matching_score']
+        f_score = row.get('final_score', score)
         ctr_s, ctor_s, rpm_s, data_src = get_content_display(handle, category, profile_by_cat)
-        tags = generate_reason(row, category, price, brand_type, is_new_launch)
+        tags    = generate_reason(row, category, price, brand_type, is_new_launch)
+        eng     = row.get('creator_avg_eng', float('nan'))
+        eng_s   = f"{eng*100:.1f}%" if pd.notna(eng) and eng > 0 else '-'
+        card_data.append(dict(
+            rank=rank, row=row, handle=handle,
+            score=score, f_score=f_score,
+            ctr_s=ctr_s, ctor_s=ctor_s, rpm_s=rpm_s,
+            data_src=data_src, tags=tags, eng=eng, eng_s=eng_s,
+        ))
 
-        eng = row.get('creator_avg_eng', float('nan'))
-        eng_s = f"{eng*100:.1f}%" if pd.notna(eng) and eng > 0 else '-'
+    # --- 构建下载 CSV ---
+    download_rows = [{
+        '排名':             d['rank'] + 1,
+        '达人账号':          f"@{d['handle']}",
+        '综合分':            f"{d['f_score']:.3f}",
+        '模型原始分':         f"{d['score']:.3f}",
+        '品类偏好度':         f"{d['row']['cat_preference']*100:.1f}%",
+        '历史带货均值($)':    f"${d['row']['creator_avg_gmv']:.1f}",
+        '历史订单数':         int(d['row']['creator_order_count']),
+        '互动率':            d['eng_s'],
+        'CTR点击率':         d['ctr_s'],
+        'CTOR转化率':        d['ctor_s'],
+        'RPM千次收益($)':    d['rpm_s'],
+        '视频数据来源':       src_label.get(d['data_src'], '-'),
+        '推荐理由':          ' | '.join(d['tags']),
+    } for d in card_data]
+
+    filter_params_rows = {
+        '搜索条件': ['品类', '定价', '佣金率', '品牌定位', '最低CTR要求', '品类带货经验', '新品冷启动', '推荐数上限', '实际返回达人数'],
+        '设置值':  [
+            category,
+            f'${price:.0f}',
+            f'{commission:.1f}%',
+            brand_type,
+            f'{min_ctr_pct:.1f}%' if min_ctr_pct > 0 else '不限',
+            cat_exp,
+            '是' if is_new_launch else '否',
+            top_n,
+            len(result),
+        ],
+    }
+
+    buf = io.StringIO()
+    buf.write('【搜索条件】\n')
+    pd.DataFrame(filter_params_rows).to_csv(buf, index=False)
+    buf.write('\n【推荐结果】\n')
+    pd.DataFrame(download_rows).to_csv(buf, index=False)
+    csv_bytes = buf.getvalue().encode('utf-8-sig')
+
+    with dl_col:
+        st.download_button(
+            label="⬇️ 下载结果 CSV",
+            data=csv_bytes,
+            file_name=f"达人推荐_{category}_{price:.0f}美元_{pd.Timestamp.now().strftime('%m%d_%H%M')}.csv",
+            mime="text/csv",
+            use_container_width=True,
+        )
+
+    # ==================== 卡片展示（紧凑版）====================
+    for d in card_data:
+        rank      = d['rank']
+        row       = d['row']
+        handle    = d['handle']
+        score     = d['score']
+        f_score   = d['f_score']
+        ctr_s     = d['ctr_s']
+        ctor_s    = d['ctor_s']
+        rpm_s     = d['rpm_s']
+        data_src  = d['data_src']
+        tags      = d['tags']
+        eng_s     = d['eng_s']
+        extra = f"&nbsp; *(模型分 {score:.3f})*" if (boost_label or is_new_launch) else ""
 
         with st.container(border=True):
-            # --- 行1：账号 + 匹配分 + 综合分 ---
+            # --- 行1：账号 + 综合分（用加粗普通文字，不用 ### 标题）---
             h_col, s_col = st.columns([3, 2])
             with h_col:
-                st.markdown(f"### #{rank+1} &nbsp; `@{handle}`")
+                st.markdown(f"**#{rank+1}** &nbsp; `@{handle}`")
             with s_col:
-                extra = f"&nbsp; *(模型原始分 {score:.3f})*" if (boost_label or is_new_launch) else ""
                 st.markdown(
                     f"**综合分** &nbsp; {score_color(f_score)} &nbsp; "
-                    f"`{score_bar(f_score)}` &nbsp; **{f_score:.3f}**{extra}"
+                    f"`{score_bar(f_score)}` &nbsp; **{f_score:.3f}**{extra}",
                 )
 
-            # --- 行2：核心指标 ---
-            m1, m2, m3, m4 = st.columns(4)
+            # --- 行2：8列指标（原两行4列合并为一行）---
+            m1, m2, m3, m4, c1, c2, c3, c_note = st.columns(8)
             with m1:
                 st.metric("品类偏好度", f"{row['cat_preference']*100:.1f}%",
                           help="该达人历史已结算订单中，此品类占比")
             with m2:
-                st.metric("历史带货均值", f"${row['creator_avg_gmv']:.1f}",
+                st.metric("带货均值GMV", f"${row['creator_avg_gmv']:.1f}",
                           help="达人历史已结算订单的平均 GMV")
             with m3:
-                st.metric("历史订单数", f"{int(row['creator_order_count'])} 条",
+                st.metric("历史订单数", f"{int(row['creator_order_count'])}条",
                           help="已结算订单总数，反映带货经验量")
             with m4:
-                st.metric("互动率（均值）", eng_s,
+                st.metric("互动率", eng_s,
                           help="历史视频（点赞+评论+分享）÷ 观看数 的平均值")
-
-            # --- 行3：内容效率（与行2等宽对齐）---
-            c1, c2, c3, c_note = st.columns(4)
             with c1:
-                st.metric("CTR 点击率", ctr_s, help="视频被点击进商品详情页的比率")
+                st.metric("CTR", ctr_s, help="视频被点击进商品详情页的比率")
             with c2:
-                st.metric("CTOR 转化率", ctor_s, help="点击后下单的比率")
+                st.metric("CTOR", ctor_s, help="点击后下单的比率")
             with c3:
-                st.metric("RPM 千次收益", rpm_s, help="每千次视频播放产生的 GMV")
+                st.metric("RPM", rpm_s, help="每千次视频播放产生的 GMV")
             with c_note:
-                st.write("")  # 占位
                 if data_src == 'overall':
-                    st.caption("⚠️ 跨品类均值（无该品类视频记录）")
+                    st.caption("⚠️ 跨品类均值")
                 elif data_src == 'no_data':
-                    st.caption("⚠️ 暂无视频效率数据")
+                    st.caption("⚠️ 无视频数据")
                 else:
-                    st.caption(f"✅ {category} 品类实际视频数据")
+                    st.caption(f"✅ {category}品类")
 
-            # --- 行4：推荐理由 ---
+            # --- 行3：推荐理由 ---
             st.markdown("**推荐理由：** " + "　".join(tags))
+
+    # ==================== 冷候选池（Fastmoss 达人榜）====================
+    if fm_file is not None:
+        with st.spinner("处理 Fastmoss 候选池..."):
+            fm_pool = load_fm_pool(fm_file)
+
+        if len(fm_pool) == 0:
+            st.info("Fastmoss 文件中未找到美妆类且有视频带货记录的达人，请确认文件格式。")
+        else:
+            # 排除模型结果中已有的达人
+            existing_handles = set(result['handle'].str.lower().tolist())
+            fm_filtered = fm_pool[~fm_pool['handle'].str.lower().isin(existing_handles)].copy()
+
+            st.divider()
+            st.subheader(f"🔍 扩展候选池  ·  Fastmoss 达人榜（{len(fm_filtered)} 位）")
+            st.caption(
+                "以下达人来自 Fastmoss 带货达人榜，无历史订单数据，评分基于规则层：**视频GMV占比（40%）× 粉丝量级适配（35%）× 带货经验（25%）**。  \n"
+                "仅供发现参考，建议人工核实内容风格与品牌调性是否匹配后再决策。"
+            )
+
+            fm_top = fm_filtered.head(top_n).reset_index(drop=True)
+
+            # 构建展示表格
+            fm_rows = []
+            for _, r in fm_top.iterrows():
+                followers = r['followers']
+                if followers >= 10_000:
+                    followers_str = f"{followers/10_000:.1f}万"
+                else:
+                    followers_str = f"{int(followers)}"
+
+                fm_rows.append({
+                    '排名':       f"#{_ + 1}",
+                    '达人账号':   f"@{r['handle']}",
+                    '昵称':       r['nickname'],
+                    '粉丝数':     followers_str,
+                    '视频GMV($)': f"${r['video_gmv']:,.0f}",
+                    '视频占比':   f"{r['video_ratio']*100:.0f}%",
+                    '候选分':     f"{r['cold_score']:.3f}",
+                    'Fastmoss':  r.get('fastmoss_url', ''),
+                })
+
+            fm_display = pd.DataFrame(fm_rows)
+            st.dataframe(fm_display, use_container_width=True, hide_index=True,
+                         column_config={
+                             'Fastmoss': st.column_config.LinkColumn('Fastmoss 详情页', display_text='🔗 查看'),
+                         })
+
+            # 冷候选池下载
+            buf2 = io.StringIO()
+            buf2.write('【搜索条件（同主推荐）】\n')
+            pd.DataFrame(filter_params_rows).to_csv(buf2, index=False)
+            buf2.write('\n【扩展候选池（Fastmoss规则层）】\n')
+            fm_display.to_csv(buf2, index=False)
+            st.download_button(
+                label="⬇️ 下载扩展候选池 CSV",
+                data=buf2.getvalue().encode('utf-8-sig'),
+                file_name=f"扩展候选池_{category}_{pd.Timestamp.now().strftime('%m%d_%H%M')}.csv",
+                mime="text/csv",
+            )
 
     st.divider()
     st.caption(
