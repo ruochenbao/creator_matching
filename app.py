@@ -3,6 +3,11 @@ import joblib
 import pandas as pd
 import numpy as np
 import io
+import os
+import pathlib
+
+# Fastmoss 候选池固定路径（与 app.py 同目录，支持 Streamlit Cloud 部署）
+_FM_AUTO_PATH = str(pathlib.Path(__file__).parent / 'fastmoss_pool.xlsx')
 
 st.set_page_config(page_title="达人匹配系统", layout="wide")
 
@@ -132,9 +137,19 @@ with st.expander("筛选与定位条件（可选）", expanded=False):
         )
 
     st.divider()
-    st.caption("**扩展候选池（可选）**：上传 Fastmoss 带货达人榜 Excel，可在模型库之外发现更多候选达人")
+    _has_auto_fm = os.path.exists(_FM_AUTO_PATH)
+    if _has_auto_fm:
+        st.caption(
+            "✅ **已检测到 Fastmoss 候选池文件**（fastmoss_pool.xlsx），点击「开始匹配」将自动加载扩展候选池。  \n"
+            "如需更新数据，可上传新文件覆盖："
+        )
+    else:
+        st.caption(
+            "**扩展候选池（可选）**：上传 Fastmoss 带货达人榜 Excel，可在模型库之外发现更多候选达人。  \n"
+            "*（也可将文件命名为 `fastmoss_pool.xlsx` 放入部署目录，下次自动加载无需上传）*"
+        )
     fm_file = st.file_uploader(
-        "Fastmoss 达人榜 Excel",
+        "Fastmoss 达人榜 Excel（上传后将覆盖自动加载）" if _has_auto_fm else "Fastmoss 达人榜 Excel",
         type=['xlsx'],
         label_visibility='collapsed',
         help="从 Fastmoss「带货达人榜」页面导出的 Excel 文件，用于扩展推荐候选池"
@@ -426,6 +441,15 @@ def load_fm_pool(uploaded_file):
     return df.sort_values('cold_score', ascending=False).reset_index(drop=True)
 
 
+@st.cache_resource
+def _try_load_fm_auto(path: str):
+    """从固定路径预加载 Fastmoss 候选池，结果缓存至 Streamlit server 重启"""
+    try:
+        return load_fm_pool(path)
+    except Exception:
+        return None
+
+
 # ==================== 推荐函数 ====================
 def recommend(category, price, commission_rate, df, model, feature_cols,
               profile_by_cat, global_medians):
@@ -656,10 +680,17 @@ if run:
             st.markdown("**推荐理由：** " + "　".join(tags))
 
     # ==================== 冷候选池（Fastmoss 达人榜）====================
+    # 优先级：手动上传 > 本地自动加载（fastmoss_pool.xlsx）> 不展示
     if fm_file is not None:
-        with st.spinner("处理 Fastmoss 候选池..."):
+        with st.spinner("处理 Fastmoss 候选池（已上传文件）..."):
             fm_pool = load_fm_pool(fm_file)
+    elif os.path.exists(_FM_AUTO_PATH):
+        with st.spinner("加载 Fastmoss 候选池（本地文件）..."):
+            fm_pool = _try_load_fm_auto(_FM_AUTO_PATH)
+    else:
+        fm_pool = None
 
+    if fm_pool is not None:
         if len(fm_pool) == 0:
             st.info("Fastmoss 文件中未找到美妆类且有视频带货记录的达人，请确认文件格式。")
         else:
